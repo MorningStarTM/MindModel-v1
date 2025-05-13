@@ -57,6 +57,7 @@ class Encoder(nn.Module):
         self.embedding = nn.Linear(self.config['input_dim'], self.config['embedding_dim'])
         self.rnn = nn.LSTM(self.config['embedding_dim'], self.hidden_dim, self.n_layers, dropout=self.config['dropout'])
         self.dropout = nn.Dropout(dropout)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
 
     def forward(self, src):
         # src = [src length, batch size]
@@ -78,6 +79,7 @@ class Decoder(nn.Module):
         self.rnn = nn.LSTM(self.config['hidden_dim'], self.config['hidden_dim'])
         self.policy_head = nn.Linear(self.config['hidden_dim'], self.config['action_dim'])
         self.value_head = nn.Linear(self.config['hidden_dim'], 1)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
 
     def forward(self, encoder_hidden):
         # decoder_input could be zeros or learned start token
@@ -128,6 +130,64 @@ class RLSeq2Seq(nn.Module):
         value = torch.squeeze(value).item()
 
         return action, probs, value
-
     
 
+
+    def learn(self):
+        for _ in range(self.n_epochs):
+            state_arr, next_state_arr, action_arr, old_prob_arr, vals_arr,\
+            reward_arr, dones_arr, batches = \
+                    self.memory.generate_batches()
+
+            values = vals_arr
+            advantage = np.zeros(len(reward_arr), dtype=np.float32)
+
+            for t in range(len(reward_arr)-1):
+                discount = 1
+                a_t = 0
+                for k in range(t, len(reward_arr)-1):
+                    a_t += discount*(reward_arr[k] + self.gamma*values[k+1]*\
+                            (1-int(dones_arr[k])) - values[k])
+                    discount *= self.gamma*self.gae_lambda
+                advantage[t] = a_t
+            advantage = torch.tensor(advantage).to(self.device)
+
+            values = torch.tensor(values).to(self.device)
+
+    
+            for batch in batches:
+                states = torch.tensor(state_arr[batch], dtype=torch.float).to(self.device)
+                next_states = torch.tensor(next_state_arr[batch], dtype=torch.float).to(self.device)
+                old_probs = torch.tensor(old_prob_arr[batch]).to(self.device)
+                actions = torch.tensor(action_arr[batch]).to(self.device)
+
+                encoder_hidden, _ = self.encoder(states)
+                action_logits, value = self.decoder(encoder_hidden)
+                action_dist = torch.distributions.Categorical(logits=action_logits)
+
+                critic_value = torch.squeeze(critic_value)
+
+
+                #n_encoder_hidden, _ = self.encoder(next_states)
+                #_, next_value = self.decoder(n_encoder_hidden)
+
+                new_probs = action_dist.log_prob(actions)
+                prob_ratio = new_probs.exp() / old_probs.exp()
+                #prob_ratio = (new_probs - old_probs).exp()
+                weighted_probs = advantage[batch] * prob_ratio
+                weighted_clipped_probs = torch.clamp(prob_ratio, 1-self.policy_clip,
+                        1+self.policy_clip)*advantage[batch]
+                actor_loss = -torch.min(weighted_probs, weighted_clipped_probs).mean()
+
+                returns = advantage[batch] + values[batch]
+                critic_loss = (returns-critic_value)**2
+                critic_loss = critic_loss.mean()
+
+                total_loss = actor_loss + 0.5*critic_loss
+                self.encoder.optimizer.zero_grad()
+                self.decoder.optimizer.zero_grad()
+                total_loss.backward()
+                self.encoder.optimizer.step()
+                self.decoder.optimizer.step()
+
+        self.memory.clear_memory()
