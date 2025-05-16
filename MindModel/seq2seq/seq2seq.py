@@ -5,45 +5,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 from MindModel.utility.config import *
 import numpy as np
+from MindModel.utility.logger import logger
+from torch.distributions import Categorical, MultivariateNormal
 
-class PPOMemory:
-    def __init__(self, batch_size):
-        self.states = []
-        self.next_states = []
-        self.probs = []
-        self.vals = []
+class RolloutBuffer:
+    def __init__(self):
         self.actions = []
+        self.states = []
+        self.logprobs = []
         self.rewards = []
-        self.dones = []
-
-        self.batch_size = batch_size
-
-    def generate_batches(self):
-        n_states = len(self.states)
-        batch_start = np.arange(0, n_states, self.batch_size)
-        indices = np.arange(n_states, dtype=np.int64)
-        np.random.shuffle(indices)
-        batches = [indices[i:i+self.batch_size] for i in batch_start]
-
-        return np.array(self.states), np.array(self.next_states), np.array(self.actions), np.array(self.probs),np.array(self.vals),np.array(self.rewards), np.array(self.dones), batches
+        self.state_values = []
+        self.is_terminals = []
     
-    def store_memory(self, state, next_state, action, probs, vals, reward, done):
-        self.states.append(state)
-        self.next_states.append(next_state)
-        self.actions.append(action)
-        self.probs.append(probs)
-        self.vals.append(vals)
-        self.rewards.append(reward)
-        self.dones.append(done)
-
-    def clear_memory(self):
-        self.states = []
-        self.next_states = []
-        self.probs = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-        self.vals = []
+    def clear(self):
+        del self.actions[:]
+        del self.states[:]
+        del self.logprobs[:]
+        del self.rewards[:]
+        del self.state_values[:]
+        del self.is_terminals[:]
 
 
 
@@ -61,6 +41,7 @@ class Encoder(nn.Module):
 
     def forward(self, src):
         # src = [src length, batch size]
+
         embedded = self.dropout(self.embedding(src))
         # embedded = [src length, batch size, embedding dim]
         outputs, (hidden, cell) = self.rnn(embedded)
@@ -75,24 +56,55 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.config = config
-        self.rnn = nn.LSTM(self.config['hidden_dim'], self.config['hidden_dim'])
+        self.rnn = nn.LSTM(self.config['hidden_dim'], self.config['hidden_dim'], self.config['n_layers'])
+
         self.policy_head = nn.Linear(self.config['hidden_dim'], self.config['action_dim'])
         self.value_head = nn.Linear(self.config['hidden_dim'], 1)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
 
-    def forward(self, encoder_hidden):
-        # decoder_input could be zeros or learned start token
+
+    def forward(self):
+        raise NotImplementedError
+    
+
+    def act(self, encoder_hidden):
+        # encoder_hidden: [n_layers, batch_size, hidden_dim]
         batch_size = encoder_hidden.size(1)
-        decoder_input = torch.zeros(batch_size, self.config['hidden_dim']).to(encoder_hidden.device)
+        hidden_dim = self.config['hidden_dim']
 
-        h, c = encoder_hidden[-1], torch.zeros_like(encoder_hidden[-1])  # Use last encoder layer
-        h, c = self.rnn(decoder_input.unsqueeze(0), (h.unsqueeze(0), c.unsqueeze(0)))  # Match LSTM input shape
-        h = h.squeeze(0)
+        decoder_input = torch.zeros(1, batch_size, hidden_dim, device=encoder_hidden.device)
 
-        action_logits = self.policy_head(h)
-        value = self.value_head(h)
-        return action_logits, value
+        h = encoder_hidden  # Use all layers
+        c = torch.zeros_like(h)
+
+        out, (h_out, c_out) = self.rnn(decoder_input, (h, c))
+        h_out = h_out[-1]  # use last layer’s output
+
+        action_logits = self.policy_head(h_out)
+        value = self.value_head(h_out)
+
+        dist = Categorical(logits=action_logits)
+        action = dist.sample()
+        action_logprob = dist.log_prob(action)
+
+        return action.detach(), action_logprob.detach(), value
+
+
+    
+    def set_action_std(self, new_action_std):
+        if self.config['has_continuous_action_space']:
+            self.action_var = torch.full((self.config['action_dim'],), new_action_std * new_action_std).to(self.device)
+        else:
+            print("--------------------------------------------------------------------------------------------")
+            print("WARNING : Calling ActorCritic::set_action_std() on discrete action space policy")
+            print("--------------------------------------------------------------------------------------------")
+
+
+    
+
+
     
 
 
@@ -103,91 +115,167 @@ class RLSeq2Seq(nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.encoder = encoder.to(self.device)
         self.decoder = decoder.to(self.device)
+        self.policy_old = decoder.to(device=self.device)
+        self.policy_old.load_state_dict(self.decoder.state_dict())
         
-        self.gamma = config['gamma']
-        self.policy_clip = config['policy_clip']
-        self.n_epochs = config['n_epochs']
-        self.gae_lambda = config['gae_lambda']
-        self.name = "Seq2Seq-Agent"
-        self.alpha = config['alpha']
-        self.memory = PPOMemory(config['batch_size'])
+        self.config = config
+        self.gamma = self.config['gamma']
+        self.eps_clip = self.config['eps_clip']
+        self.K_epochs = self.config['K_epochs']
+        
+        self.buffer = RolloutBuffer()
+        self.optimizer = torch.optim.Adam([
+                        {'params': self.encoder.parameters(), 'lr': self.config['lr_encoder']},
+                        {'params': self.decoder.parameters(), 'lr': self.config['lr_decoder']}
+                    ])
+        
+        self.MseLoss = nn.MSELoss()
+
+    def evaluate(self, state, action):
+        if state.dim() == 2:
+            # Convert from [batch_size, obs_dim] to [seq_len=1, batch_size, obs_dim]
+            state = state.unsqueeze(0)
+        hidden_state, _ = self.encoder(state)
+        _, action_probs, state_values = self.decoder.act(hidden_state)
+        dist = Categorical(action_probs)
+        action_logprobs = dist.log_prob(action)
+        dist_entropy = dist.entropy()
+
+        #dist = Categorical(logits=self.decoder.policy_head(state_value))  # reuse logits for entropy
+        #dist_entropy = dist.entropy()
+        
+        return action_logprobs, state_values, dist_entropy
+    
+
+    def set_action_std(self, new_action_std):
+        if self.config['has_continuous_action_space']:
+            self.action_std = new_action_std
+            self.decoder.set_action_std(new_action_std)
+            self.policy_old.set_action_std(new_action_std)
+        else:
+            print("--------------------------------------------------------------------------------------------")
+            print("WARNING : Calling PPO::set_action_std() on discrete action space policy")
+            print("--------------------------------------------------------------------------------------------")
 
     
-    def remember(self, state, next_state, action, probs, vals, reward, done):
-        self.memory.store_memory(state, next_state, action, probs, vals, reward, done)
+    def decay_action_std(self, action_std_decay_rate, min_action_std):
+        print("--------------------------------------------------------------------------------------------")
+        if self.config['has_continuous_action_space']:
+            self.action_std = self.action_std - action_std_decay_rate
+            self.action_std = round(self.action_std, 4)
+            if (self.action_std <= min_action_std):
+                self.action_std = min_action_std
+                print("setting actor output action_std to min_action_std : ", self.action_std)
+            else:
+                print("setting actor output action_std to : ", self.action_std)
+            self.set_action_std(self.action_std)
 
-    def choose_action(self, obs):
-        # obs = [seq_len, batch_size, obs_dim]
-        state = torch.from_numpy(obs).float().to(self.device)
-        encoder_hidden, _ = self.encoder(state)
-        action_logits, value = self.decoder(encoder_hidden)
-
-        action_dist = torch.distributions.Categorical(logits=action_logits)
-        action = action_dist.sample()  # shape: [batch_size]
-
-        probs = torch.squeeze(action_dist.log_prob(action)).item()
-        action = torch.squeeze(action).item()
-        value = torch.squeeze(value).item()
-
-        return action, probs, value
-    
-
-
-    def learn(self):
-        for _ in range(self.n_epochs):
-            state_arr, next_state_arr, action_arr, old_prob_arr, vals_arr,\
-            reward_arr, dones_arr, batches = \
-                    self.memory.generate_batches()
-
-            values = vals_arr
-            advantage = np.zeros(len(reward_arr), dtype=np.float32)
-
-            for t in range(len(reward_arr)-1):
-                discount = 1
-                a_t = 0
-                for k in range(t, len(reward_arr)-1):
-                    a_t += discount*(reward_arr[k] + self.gamma*values[k+1]*\
-                            (1-int(dones_arr[k])) - values[k])
-                    discount *= self.gamma*self.gae_lambda
-                advantage[t] = a_t
-            advantage = torch.tensor(advantage).to(self.device)
-
-            values = torch.tensor(values).to(self.device)
+        else:
+            print("WARNING : Calling PPO::decay_action_std() on discrete action space policy")
+        print("--------------------------------------------------------------------------------------------")
 
     
-            for batch in batches:
-                states = torch.tensor(state_arr[batch], dtype=torch.float).to(self.device)
-                next_states = torch.tensor(next_state_arr[batch], dtype=torch.float).to(self.device)
-                old_probs = torch.tensor(old_prob_arr[batch]).to(self.device)
-                actions = torch.tensor(action_arr[batch]).to(self.device)
+    def select_action(self, state):
 
-                encoder_hidden, _ = self.encoder(states)
-                action_logits, value = self.decoder(encoder_hidden)
-                action_dist = torch.distributions.Categorical(logits=action_logits)
+        if self.config['has_continuous_action_space']:
+            with torch.no_grad():
+                state = torch.FloatTensor(state).to(self.device)
+                hidden_state, _ = self.encoder(state.unsqueeze(0).unsqueeze(0))
+                action, action_logprob, state_val = self.policy_old.act(hidden_state)
 
-                critic_value = torch.squeeze(critic_value)
+            self.buffer.states.append(state)
+            self.buffer.actions.append(action)
+            self.buffer.logprobs.append(action_logprob)
+            self.buffer.state_values.append(state_val)
+
+            return action.detach().cpu().numpy().flatten()
+        else:
+            with torch.no_grad():
+                state = torch.FloatTensor(state).to(self.device)
+                hidden_state, _ = self.encoder(state.unsqueeze(0).unsqueeze(0))
+                action, action_logprob, state_val = self.policy_old.act(hidden_state)
+            
+            self.buffer.states.append(state)
+            self.buffer.actions.append(action)
+            self.buffer.logprobs.append(action_logprob)
+            self.buffer.state_values.append(state_val)
+
+            return action.item()
+        
+
+    def update(self):
+        # Monte Carlo estimate of returns
+        rewards = []
+        discounted_reward = 0
+        for reward, is_terminal in zip(reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)):
+            if is_terminal:
+                discounted_reward = 0
+            discounted_reward = reward + (self.gamma * discounted_reward)
+            rewards.insert(0, discounted_reward)
+            
+        # Normalizing the rewards
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+
+        # convert list to tensor
+        old_states = torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(self.device)
+        old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(self.device)
+        old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(self.device)
+        old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(self.device)
+
+        # calculate advantages
+        advantages = rewards.detach() - old_state_values.detach()
+
+        # Optimize policy for K epochs
+        for _ in range(self.K_epochs):
+
+            # Evaluating old actions and values
+            logprobs, state_values, dist_entropy = self.evaluate(old_states, old_actions)
+
+            # match state_values tensor dimensions with rewards tensor
+            state_values = torch.squeeze(state_values)
+            
+            # Finding the ratio (pi_theta / pi_theta__old)
+            ratios = torch.exp(logprobs - old_logprobs.detach())
+
+            # Finding Surrogate Loss  
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+
+            # final loss of clipped objective PPO
+            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - 0.01 * dist_entropy
+            
+            # take gradient step
+            self.optimizer.zero_grad()
+            loss.mean().backward()
+            self.optimizer.step()
+            
+        # Copy new weights into old policy
+        self.policy_old.load_state_dict(self.decoder.state_dict())
+
+        # clear buffer
+        self.buffer.clear()
 
 
-                #n_encoder_hidden, _ = self.encoder(next_states)
-                #_, next_value = self.decoder(n_encoder_hidden)
 
-                new_probs = action_dist.log_prob(actions)
-                prob_ratio = new_probs.exp() / old_probs.exp()
-                #prob_ratio = (new_probs - old_probs).exp()
-                weighted_probs = advantage[batch] * prob_ratio
-                weighted_clipped_probs = torch.clamp(prob_ratio, 1-self.policy_clip,
-                        1+self.policy_clip)*advantage[batch]
-                actor_loss = -torch.min(weighted_probs, weighted_clipped_probs).mean()
+    def save_models(self, checkpoint="models/seq2seq"):
+        os.makedirs(checkpoint, exist_ok=True)
+        torch.save(self.encoder.state_dict(), os.path.join(checkpoint, "encoder.pt"))
+        torch.save(self.decoder.state_dict(), os.path.join(checkpoint, "decoder.pt"))
+        logger.info(f"Models saved to {checkpoint}")
 
-                returns = advantage[batch] + values[batch]
-                critic_loss = (returns-critic_value)**2
-                critic_loss = critic_loss.mean()
+    def load_models(self, checkpoint="models/seq2seq"):
+        encoder_path = os.path.join(checkpoint, "encoder.pt")
+        decoder_path = os.path.join(checkpoint, "decoder.pt")
 
-                total_loss = actor_loss + 0.5*critic_loss
-                self.encoder.optimizer.zero_grad()
-                self.decoder.optimizer.zero_grad()
-                total_loss.backward()
-                self.encoder.optimizer.step()
-                self.decoder.optimizer.step()
+        if os.path.exists(encoder_path):
+            self.encoder.load_state_dict(torch.load(encoder_path, map_location=self.device))
+        else:
+            logger.warning(f"Encoder checkpoint not found at {encoder_path}")
 
-        self.memory.clear_memory()
+        if os.path.exists(decoder_path):
+            self.decoder.load_state_dict(torch.load(decoder_path, map_location=self.device))
+        else:
+            logger.warning(f"Decoder checkpoint not found at {decoder_path}")
+
+        logger.info(f"Models loaded from {checkpoint}")
