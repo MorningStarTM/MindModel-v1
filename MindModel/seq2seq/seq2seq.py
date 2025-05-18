@@ -3,7 +3,6 @@ import os
 import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
-from MindModel.utility.config import *
 import numpy as np
 from MindModel.utility.logger import logger
 from torch.distributions import Categorical, MultivariateNormal
@@ -16,6 +15,7 @@ class RolloutBuffer:
         self.rewards = []
         self.state_values = []
         self.is_terminals = []
+        self.prev_contexts = []
     
     def clear(self):
         del self.actions[:]
@@ -24,6 +24,8 @@ class RolloutBuffer:
         del self.rewards[:]
         del self.state_values[:]
         del self.is_terminals[:]
+        del self.prev_contexts[:]
+
 
 
 
@@ -36,7 +38,7 @@ class Encoder(nn.Module):
         self.n_layers = self.config['n_layers']
         self.embedding = nn.Linear(self.config['input_dim'], self.config['embedding_dim'])
         self.rnn = nn.LSTM(self.config['embedding_dim'], self.hidden_dim, self.n_layers, dropout=self.config['dropout'])
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(0.1)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
 
     def forward(self, src):
@@ -59,22 +61,31 @@ class Decoder(nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.config = config
         self.rnn = nn.LSTM(self.config['hidden_dim'], self.config['hidden_dim'], self.config['n_layers'])
+        self.context_embed = nn.Linear(config['input_dim'] + config['action_dim'], config['hidden_dim'])  
+
 
         self.policy_head = nn.Linear(self.config['hidden_dim'], self.config['action_dim'])
         self.value_head = nn.Linear(self.config['hidden_dim'], 1)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
 
 
+
     def forward(self):
         raise NotImplementedError
     
 
-    def act(self, encoder_hidden):
-        # encoder_hidden: [n_layers, batch_size, hidden_dim]
+    def act(self, encoder_hidden,prev_context=None):
         batch_size = encoder_hidden.size(1)
         hidden_dim = self.config['hidden_dim']
 
-        decoder_input = torch.zeros(1, batch_size, hidden_dim, device=encoder_hidden.device)
+
+        if prev_context is None:
+            decoder_input = torch.zeros(1, batch_size, self.config['hidden_dim'], device=self.device)
+        else:
+            embedded_context = self.context_embed(prev_context)  # [batch_size, hidden_dim]
+            decoder_input = embedded_context.unsqueeze(0)  # [1, batch_size, hidden_dim]
+        # encoder_hidden: [n_layers, batch_size, hidden_dim]
+        
 
         h = encoder_hidden  # Use all layers
         c = torch.zeros_like(h)
@@ -85,11 +96,8 @@ class Decoder(nn.Module):
         action_logits = self.policy_head(h_out)
         value = self.value_head(h_out)
 
-        dist = Categorical(logits=action_logits)
-        action = dist.sample()
-        action_logprob = dist.log_prob(action)
 
-        return action.detach(), action_logprob.detach(), value
+        return action_logits, value
 
 
     
@@ -131,20 +139,24 @@ class RLSeq2Seq(nn.Module):
         
         self.MseLoss = nn.MSELoss()
 
-    def evaluate(self, state, action):
+    def evaluate(self, state, action, prev_context=None):
         if state.dim() == 2:
-            # Convert from [batch_size, obs_dim] to [seq_len=1, batch_size, obs_dim]
             state = state.unsqueeze(0)
         hidden_state, _ = self.encoder(state)
-        _, action_probs, state_values = self.decoder.act(hidden_state)
-        dist = Categorical(action_probs)
+        if prev_context is not None:
+            prev_context = prev_context.to(self.device)
+        action_probs, state_values = self.decoder.act(hidden_state, prev_context)
+        dist = Categorical(logits=action_probs)
         action_logprobs = dist.log_prob(action)
         dist_entropy = dist.entropy()
+
+        return action_logprobs, state_values, dist_entropy
+
 
         #dist = Categorical(logits=self.decoder.policy_head(state_value))  # reuse logits for entropy
         #dist_entropy = dist.entropy()
         
-        return action_logprobs, state_values, dist_entropy
+        
     
 
     def set_action_std(self, new_action_std):
@@ -175,7 +187,7 @@ class RLSeq2Seq(nn.Module):
         print("--------------------------------------------------------------------------------------------")
 
     
-    def select_action(self, state):
+    def select_action(self, state, prev_context=None):
 
         if self.config['has_continuous_action_space']:
             with torch.no_grad():
@@ -192,15 +204,22 @@ class RLSeq2Seq(nn.Module):
         else:
             with torch.no_grad():
                 state = torch.FloatTensor(state).to(self.device)
-                hidden_state, _ = self.encoder(state.unsqueeze(0).unsqueeze(0))
-                action, action_logprob, state_val = self.policy_old.act(hidden_state)
-            
-            self.buffer.states.append(state)
-            self.buffer.actions.append(action)
-            self.buffer.logprobs.append(action_logprob)
-            self.buffer.state_values.append(state_val)
+                hidden_state, _ = self.encoder(state.unsqueeze(0).unsqueeze(0))  # [1, 1, obs_dim]
+                if prev_context is not None:
+                    prev_context = torch.FloatTensor(prev_context).to(self.device).unsqueeze(0)  # [1, context_dim]
+                action_logits, state_val = self.policy_old.act(hidden_state, prev_context)
+                dist = Categorical(logits=action_logits)
+                action = dist.sample()
+                action_logprob = dist.log_prob(action)
 
-            return action.item()
+
+
+            self.buffer.states.append(state)
+            self.buffer.actions.append(action.detach())
+            self.buffer.logprobs.append(action_logprob.detach())
+            self.buffer.state_values.append(state_val.detach())
+
+            return action.item(), prev_context.squeeze(0).cpu().numpy() if prev_context is not None else None
         
 
     def update(self):
@@ -222,6 +241,7 @@ class RLSeq2Seq(nn.Module):
         old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(self.device)
         old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(self.device)
         old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(self.device)
+        old_prev_contexts = torch.squeeze(torch.stack(self.buffer.prev_contexts, dim=0)).detach().to(self.device)
 
         # calculate advantages
         advantages = rewards.detach() - old_state_values.detach()
@@ -230,7 +250,7 @@ class RLSeq2Seq(nn.Module):
         for _ in range(self.K_epochs):
 
             # Evaluating old actions and values
-            logprobs, state_values, dist_entropy = self.evaluate(old_states, old_actions)
+            logprobs, state_values, dist_entropy = self.evaluate(old_states, old_actions, old_prev_contexts)
 
             # match state_values tensor dimensions with rewards tensor
             state_values = torch.squeeze(state_values)
@@ -248,6 +268,8 @@ class RLSeq2Seq(nn.Module):
             # take gradient step
             self.optimizer.zero_grad()
             loss.mean().backward()
+            torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), max_norm=0.5)
+
             self.optimizer.step()
             
         # Copy new weights into old policy
