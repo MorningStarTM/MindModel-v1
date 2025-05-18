@@ -13,6 +13,8 @@ from tqdm import tqdm
 from MindModel.utility.logger import logger
 from MindModel.seq2seq.seq2seq import RLSeq2Seq
 from tqdm import trange
+import numpy as np
+import csv
 
 
 
@@ -28,6 +30,8 @@ class Seq2SeqTrainer:
         self.best_score = 0.0
         self.score_history = []
         self.config = config
+        self.episode_rewards = []  # Stores total reward per episode
+        self.step_rewards = []     # Stores every single reward at each timestep
 
         self.log_dir = "model_logs"
         if not os.path.exists(self.log_dir):
@@ -42,7 +46,7 @@ class Seq2SeqTrainer:
         run_num = len(current_num_files)
 
         #### create new log file for each run
-        self.log_f_name = self.log_dir + '/PPO_' + env_name + "_log_" + str(run_num) + ".csv"
+        self.log_f_name = self.log_dir + '/Seq2SeqRL_' + env_name + "_log_" + str(run_num) + ".csv"
 
         logger.info("current logging run number for " + env_name + " : ", run_num)
         logger.info("logging at : " + self.log_f_name)
@@ -55,9 +59,26 @@ class Seq2SeqTrainer:
         if not os.path.exists(self.directory):
             os.makedirs(self.directory)
 
+        self.reward_folder = 'rewards'
+        if not os.path.exists(self.reward_folder):
+            os.makedirs(self.reward_folder)
+
+        self.reward_folder = self.reward_folder + '/' + env_name + '/'
+        if not os.path.exists(self.reward_folder):
+            os.makedirs(self.reward_folder)
         
 
-
+        self.trace_log_file = os.path.join(self.log_dir, f"trace_log_{env_name}.csv")
+        with open(self.trace_log_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "episode", "step",
+                "encoder_input",         # state
+                "action",                # selected action
+                "prev_obs",              # previous observation
+                "prev_action",           # previous action
+                "decoder_input"          # combined [prev_obs + one_hot(prev_action)]
+            ])
 
     
 
@@ -85,17 +106,57 @@ class Seq2SeqTrainer:
 
             state, _ = self.env.reset()
             current_ep_reward = 0
+            prev_obs = None
+            prev_action = None
+
 
             for t in range(1, self.config['max_ep_len']+1):
+                if prev_obs is not None and prev_action is not None:
+                    prev_context = np.concatenate([prev_obs, np.eye(self.config['action_dim'])[prev_action]])
+                else:
+                    prev_context = None
 
                 # select action with policy
 
-                action = self.agent.select_action(state)
-                state, reward, done, _, _ = self.env.step(action)
+                action, new_context = self.agent.select_action(state, prev_context=prev_context)
+
+                next_state, reward, done, _, _ = self.env.step(action)
+                self.step_rewards.append(reward)
+
+                decoder_input = None
+                if prev_obs is not None and prev_action is not None:
+                    one_hot_action = np.eye(self.config['action_dim'])[prev_action]
+                    decoder_input = np.concatenate([prev_obs, one_hot_action])
+                else:
+                    decoder_input = np.zeros(self.config['input_dim'] + self.config['action_dim'])
+
+                with open(self.trace_log_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        i_episode,
+                        t,
+                        state.tolist(),                 # encoder input
+                        action,
+                        prev_obs.tolist() if prev_obs is not None else None,
+                        prev_action,
+                        decoder_input.tolist()
+                    ])
+
 
                 # saving reward and is_terminals
                 self.agent.buffer.rewards.append(reward)
                 self.agent.buffer.is_terminals.append(done)
+                if prev_obs is not None and prev_action is not None:
+                    prev_context = np.concatenate([prev_obs, np.eye(self.config['action_dim'])[prev_action]])
+                    self.agent.buffer.prev_contexts.append(torch.FloatTensor(prev_context))
+                else:
+                    self.agent.buffer.prev_contexts.append(torch.zeros(self.config['input_dim'] + self.config['action_dim']))
+
+
+
+                prev_obs = state
+                prev_action = action
+                state = next_state
 
                 time_step +=1
                 current_ep_reward += reward
@@ -145,7 +206,8 @@ class Seq2SeqTrainer:
                 # break; if the episode is over
                 if done:
                     break
-
+                
+            self.episode_rewards.append(current_ep_reward)
             print_running_reward += current_ep_reward
             print_running_episodes += 1
 
@@ -164,3 +226,7 @@ class Seq2SeqTrainer:
         logger.info("Finished training at (GMT) : ", end_time)
         logger.info("Total training time  : ", end_time - start_time)
         logger.info("============================================================================================")
+
+        np.save(os.path.join(self.reward_folder, f"seq_{self.env_name}_step_rewards.npy"), np.array(self.step_rewards))
+        np.save(os.path.join(self.reward_folder, f"seq_{self.env_name}_episode_rewards.npy"), np.array(self.episode_rewards))
+        logger.info(f"Saved step_rewards and episode_rewards to {self.log_dir}")
