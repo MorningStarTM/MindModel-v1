@@ -320,7 +320,6 @@ class MindEncoder(nn.Module):
         self.embedding = nn.Linear(self.config['input_dim'], self.config['embedding_dim'])
         self.rnn = nn.LSTM(self.config['embedding_dim'], self.hidden_dim, self.n_layers, dropout=self.config['dropout'])
         self.dropout = nn.Dropout(0.1)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
 
     def forward(self, src):
         # src = [src length, batch size]
@@ -350,7 +349,6 @@ class MindDecoder(nn.Module):
         self.reward_head = nn.Linear(self.config['hidden_dim'], 1)
         self.done_head = nn.Linear(self.config['hidden_dim'], 1)  # sigmoid for binary
 
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
 
     def forward(self, hidden_state, action, obs):
         # Ensure action is converted to one-hot correctly
@@ -392,13 +390,12 @@ class MindModel(nn.Module):
         self.encoder = encoder.to(self.device)
         self.decoder = decoder.to(self.device)
         self.config = config
+        self.horizon = self.config['horizon']
         
         self.optimizer = torch.optim.Adam([
                         {'params': self.encoder.parameters(), 'lr': self.config['lr_encoder']},
                         {'params': self.decoder.parameters(), 'lr': self.config['lr_decoder']}
                     ])
-        self.MseLoss = nn.MSELoss()
-        self.BCELoss = nn.BCELoss()
 
     
     def forward(self, obs, action, prev_obs):
@@ -414,7 +411,7 @@ class MindModel(nn.Module):
         pred_reward = []
         pred_done = []
 
-        for step in range(horizon):
+        for step in range(self.horizon):
             next_obs, reward, done = self.decoder(hidden_state, action[step], prev_obs)
             pred_next_obs.append(next_obs)
             pred_reward.append(reward)
@@ -427,3 +424,38 @@ class MindModel(nn.Module):
                 "reward": pred_reward,       # List[Tensor]
                 "done": pred_done            # List[Tensor]
             }
+    
+
+    def save(self, folder: str = "checkpoints", filename: str = "mindmodel.pt"):
+        
+        save_path = os.path.join(folder, filename)
+
+        torch.save({
+            'encoder_state_dict': self.encoder.state_dict(),
+            'decoder_state_dict': self.decoder.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }, save_path)
+
+        logger.info(f"✅ Model saved at: {save_path}")
+
+
+    def load(self, folder: str = "checkpoints", filename: str = "mindmodel.pt"):
+        load_path = os.path.join(folder, filename)
+
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"❌ Model file not found at: {load_path}")
+
+        checkpoint = torch.load(load_path, map_location=self.device)
+        self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+        self.decoder.load_state_dict(checkpoint['decoder_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        logger.info(f"✅ Model loaded from: {load_path}")
+
+
+
+
+
+
+
+
