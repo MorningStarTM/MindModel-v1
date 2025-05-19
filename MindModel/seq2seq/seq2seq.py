@@ -405,3 +405,25 @@ class MindModel(nn.Module):
         hidden_state, cell = self.encoder(obs)
         next_obs, reward, done = self.decoder(hidden_state, action, prev_obs)
         return next_obs, reward, done
+    
+
+
+    def horizon_predict(self, obs, action:list, prev_obs, horizon):
+        hidden_state, cell = self.encoder(obs)
+        pred_next_obs = []
+        pred_reward = []
+        pred_done = []
+
+        for step in range(horizon):
+            next_obs, reward, done = self.decoder(hidden_state, action[step], prev_obs)
+            pred_next_obs.append(next_obs)
+            pred_reward.append(reward)
+            pred_done.append(done)
+            prev_obs = next_obs
+        
+
+        return {
+                "next_obs": pred_next_obs,   # List[Tensor]
+                "reward": pred_reward,       # List[Tensor]
+                "done": pred_done            # List[Tensor]
+            }
