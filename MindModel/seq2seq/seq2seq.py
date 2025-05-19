@@ -301,3 +301,107 @@ class RLSeq2Seq(nn.Module):
             logger.warning(f"Decoder checkpoint not found at {decoder_path}")
 
         logger.info(f"Models loaded from {checkpoint}")
+
+
+
+
+
+
+
+
+
+###########################################################################################################################################################3
+class MindEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_dim = self.config['hidden_dim']
+        self.n_layers = self.config['n_layers']
+        self.embedding = nn.Linear(self.config['input_dim'], self.config['embedding_dim'])
+        self.rnn = nn.LSTM(self.config['embedding_dim'], self.hidden_dim, self.n_layers, dropout=self.config['dropout'])
+        self.dropout = nn.Dropout(0.1)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
+
+    def forward(self, src):
+        # src = [src length, batch size]
+
+        embedded = self.dropout(self.embedding(src))
+        # embedded = [src length, batch size, embedding dim]
+        outputs, (hidden, cell) = self.rnn(embedded)
+        # outputs = [src length, batch size, hidden dim * n directions]
+        # hidden = [n layers * n directions, batch size, hidden dim]
+        # cell = [n layers * n directions, batch size, hidden dim]
+        # outputs are always from the top hidden layer
+        return hidden, cell
+    
+
+
+class MindDecoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.config = config
+
+        self.rnn = nn.LSTM(self.config['hidden_dim'], self.config['hidden_dim'], self.config['n_layers'])
+        self.context_embed = nn.Linear(self.config['input_dim'] + self.config['action_dim'], self.config['hidden_dim'])
+
+        # output heads
+        self.next_obs_head = nn.Linear(self.config['hidden_dim'], self.config['input_dim'])
+        self.reward_head = nn.Linear(self.config['hidden_dim'], 1)
+        self.done_head = nn.Linear(self.config['hidden_dim'], 1)  # sigmoid for binary
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'])
+
+    def forward(self, hidden_state, action, obs):
+        # Ensure action is converted to one-hot correctly
+        action_one_hot = F.one_hot(torch.tensor(action), num_classes=self.config['action_dim']).float().to(self.device)
+
+        # Make sure both are 1D
+        if obs.dim() == 2:
+            obs = obs.squeeze(0)  # From [1, input_dim] to [input_dim]
+
+        # Concatenate: [input_dim + action_dim]
+        prev_cont = torch.cat([obs, action_one_hot], dim=-1).unsqueeze(0)  # Shape: [1, input+action]
+        
+        # Embed and reshape for RNN: [1, 1, hidden_dim]
+        embedded_input = self.context_embed(prev_cont).unsqueeze(0)
+
+        # Init hidden/cell
+        h = hidden_state
+        c = torch.zeros_like(h).to(self.device)
+
+        out, _ = self.rnn(embedded_input, (h, c))
+        out = out.squeeze(0).squeeze(0)
+
+        # Heads
+        next_obs = self.next_obs_head(out)
+        reward = self.reward_head(out)
+        done = torch.sigmoid(self.done_head(out))
+
+        return next_obs, reward, done
+
+
+
+    
+
+    
+class MindModel(nn.Module):
+    def __init__(self, encoder:MindEncoder, decoder:MindDecoder, config):
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.encoder = encoder.to(self.device)
+        self.decoder = decoder.to(self.device)
+        self.config = config
+        
+        self.optimizer = torch.optim.Adam([
+                        {'params': self.encoder.parameters(), 'lr': self.config['lr_encoder']},
+                        {'params': self.decoder.parameters(), 'lr': self.config['lr_decoder']}
+                    ])
+        self.MseLoss = nn.MSELoss()
+        self.BCELoss = nn.BCELoss()
+
+    
+    def forward(self, obs, action, prev_obs):
+        hidden_state, cell = self.encoder(obs)
+        next_obs, reward, done = self.decoder(hidden_state, action, prev_obs)
+        return next_obs, reward, done
