@@ -383,3 +383,52 @@ class MindModelTrainer:
                 logger.info(f"Epoch [{epoch}/{num_epochs}] | Loss: {avg_loss:.6f} | Done Accuracy: {avg_done_acc:.4f}")
 
 
+
+    @torch.no_grad()
+    def evaluate(self, test_loader):
+        self.model.eval()
+        total_loss = 0
+        total_done_correct = 0
+        total_done_samples = 0
+
+        for batch in test_loader:
+            obs = batch['obs'].to(self.device)                 # [B, input_dim]
+            action = batch['actions'].to(self.device)          # [B, horizon]
+            next_obs = batch['next_obs'].to(self.device)       # [B, horizon, input_dim]
+            reward = batch['rewards'].to(self.device)          # [B, horizon]
+            done = batch['dones'].to(self.device)              # [B, horizon]
+
+            batch_size = obs.size(0)
+            obs = obs.unsqueeze(0)  # [1, B, input_dim]
+
+            prev_obs = torch.randn(batch_size, self.config['input_dim']).to(self.device)
+            output = self.model.horizon_predict(obs, action, prev_obs)
+
+            pred_next_obs = output['next_obs']   # list of [B, input_dim]
+            pred_reward = output['reward']       # list of [B, 1]
+            pred_done = output['done']           # list of [B, 1]
+
+            loss_next_obs = 0
+            loss_reward = 0
+            loss_done = 0
+
+            for i in range(self.horizon):
+                loss_next_obs += self.MseLoss(pred_next_obs[i], next_obs[:, i, :])
+                loss_reward += self.MseLoss(pred_reward[i].squeeze(-1), reward[:, i])
+                loss_done += self.BCELoss(pred_done[i].squeeze(-1), done[:, i])
+
+                pred_labels = (pred_done[i].squeeze(-1) > 0.5).float()
+                total_done_correct += (pred_labels == done[:, i]).sum().item()
+                total_done_samples += done[:, i].numel()
+
+            loss_next_obs /= self.horizon
+            loss_reward /= self.horizon
+            loss_done /= self.horizon
+            total = loss_next_obs + loss_reward + loss_done
+            total_loss += total.item()
+
+        avg_loss = total_loss / len(test_loader)
+        avg_done_acc = total_done_correct / total_done_samples
+
+        logger.info(f"✅ Evaluation complete: Loss={avg_loss:.4f}, Done Accuracy={avg_done_acc:.4f}")
+    
