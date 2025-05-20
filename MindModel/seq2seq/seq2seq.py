@@ -350,16 +350,17 @@ class MindDecoder(nn.Module):
         self.done_head = nn.Linear(self.config['hidden_dim'], 1)  # sigmoid for binary
 
 
-    def forward(self, hidden_state, action, obs):
+    def forward_(self, hidden_state, action, prev_obs):
         # Ensure action is converted to one-hot correctly
-        action_one_hot = F.one_hot(torch.tensor(action), num_classes=self.config['action_dim']).float().to(self.device)
+        action_one_hot = F.one_hot(action, num_classes=self.config['action_dim']).float().to(self.device)
+        logger.debug(f"Action one-hot shape: {action_one_hot.shape}")
 
         # Make sure both are 1D
-        if obs.dim() == 2:
-            obs = obs.squeeze(0)  # From [1, input_dim] to [input_dim]
-
+        if prev_obs.dim() == 2:
+            prev_obs = prev_obs.squeeze(0)  # From [1, input_dim] to [input_dim]
+        logger.info(f"prev obs shape: {prev_obs.shape}")
         # Concatenate: [input_dim + action_dim]
-        prev_cont = torch.cat([obs, action_one_hot], dim=-1).unsqueeze(0)  # Shape: [1, input+action]
+        prev_cont = torch.cat([prev_obs, action_one_hot], dim=-1).unsqueeze(0)  # Shape: [1, input+action]
         
         # Embed and reshape for RNN: [1, 1, hidden_dim]
         embedded_input = self.context_embed(prev_cont).unsqueeze(0)
@@ -372,6 +373,30 @@ class MindDecoder(nn.Module):
         out = out.squeeze(0).squeeze(0)
 
         # Heads
+        next_obs = self.next_obs_head(out)
+        reward = self.reward_head(out)
+        done = torch.sigmoid(self.done_head(out))
+
+        return next_obs, reward, done
+    
+    def forward(self, hidden_state, action, prev_obs):
+        """
+        hidden_state: [n_layers, batch_size, hidden_dim]
+        action: [batch_size]  (discrete action index)
+        obs: [batch_size, input_dim]
+        """
+        assert torch.max(action).item() < self.config['action_dim'], f"Invalid action index {torch.max(action).item()}, must be < action_dim={self.config['action_dim']}"
+
+        action_one_hot = F.one_hot(action, num_classes=self.config['action_dim']).float().to(self.device)
+        prev_cont = torch.cat([prev_obs, action_one_hot], dim=-1)  # [batch_size, input+action]
+        embedded_input = self.context_embed(prev_cont).unsqueeze(0)  # [1, batch_size, hidden_dim]
+
+        h = hidden_state  # [n_layers, batch_size, hidden_dim]
+        c = torch.zeros_like(h).to(self.device)
+
+        out, _ = self.rnn(embedded_input, (h, c))  # [1, batch, hidden_dim]
+        out = out.squeeze(0)  # [batch, hidden_dim]
+
         next_obs = self.next_obs_head(out)
         reward = self.reward_head(out)
         done = torch.sigmoid(self.done_head(out))
@@ -405,25 +430,33 @@ class MindModel(nn.Module):
     
 
 
-    def horizon_predict(self, obs, action:list, prev_obs, horizon):
-        hidden_state, cell = self.encoder(obs)
+    def horizon_predict(self, obs, actions, prev_obs):
+        """
+        obs:        [batch_size, 1, input_dim] or [1, 1, input_dim]
+        actions:    [batch_size, horizon]
+        prev_obs:   [batch_size, input_dim]
+        """
+        hidden_state, _ = self.encoder(obs)  # [n_layers, batch_size, hidden_dim]
+
         pred_next_obs = []
         pred_reward = []
         pred_done = []
 
         for step in range(self.horizon):
-            next_obs, reward, done = self.decoder(hidden_state, action[step], prev_obs)
-            pred_next_obs.append(next_obs)
-            pred_reward.append(reward)
-            pred_done.append(done)
-            prev_obs = next_obs
-        
+            current_actions = actions[:, step]  # [batch_size]
+            next_obs, reward, done = self.decoder(hidden_state, current_actions, prev_obs)
+
+            pred_next_obs.append(next_obs)  # each: [batch_size, input_dim]
+            pred_reward.append(reward)      # each: [batch_size, 1]
+            pred_done.append(done)          # each: [batch_size, 1]
+
+            prev_obs = next_obs.detach()  # for next step
 
         return {
-                "next_obs": pred_next_obs,   # List[Tensor]
-                "reward": pred_reward,       # List[Tensor]
-                "done": pred_done            # List[Tensor]
-            }
+            "next_obs": pred_next_obs,  # list of Tensors [B, input_dim]
+            "reward": pred_reward,      # list of Tensors [B, 1]
+            "done": pred_done           # list of Tensors [B, 1]
+        }
     
 
     def save(self, folder: str = "checkpoints", filename: str = "mindmodel.pt"):
