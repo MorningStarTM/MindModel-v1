@@ -11,7 +11,8 @@ import itertools
 import torch
 from tqdm import tqdm
 from MindModel.utility.logger import logger
-from MindModel.seq2seq.seq2seq import RLSeq2Seq
+from MindModel.seq2seq.seq2seq import RLSeq2Seq, MindModel
+import torch.nn as nn
 from tqdm import trange
 import numpy as np
 import csv
@@ -227,6 +228,158 @@ class Seq2SeqTrainer:
         logger.info("Total training time  : ", end_time - start_time)
         logger.info("============================================================================================")
 
-        np.save(os.path.join(self.reward_folder, f"seq_{self.env_name}_step_rewards.npy"), np.array(self.step_rewards))
-        np.save(os.path.join(self.reward_folder, f"seq_{self.env_name}_episode_rewards.npy"), np.array(self.episode_rewards))
+        np.save(os.path.join(self.reward_folder, f"seq2seqBasic_{self.env_name}_step_rewards.npy"), np.array(self.step_rewards))
+        np.save(os.path.join(self.reward_folder, f"seq2seqBasic_{self.env_name}_episode_rewards.npy"), np.array(self.episode_rewards))
         logger.info(f"Saved step_rewards and episode_rewards to {self.log_dir}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class MindModelTrainer:
+    def __init__(self, model: MindModel, config) -> None:
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.horizon = self.config['horizon']
+        self.model = model.to(self.device)
+
+        self.MseLoss = nn.MSELoss()
+        self.BCELoss = nn.BCELoss()
+
+        self.model_dir = "MindModel_version"
+        os.makedirs(self.model_dir, exist_ok=True)
+        logger.info(f"Model directory created at {self.model_dir}")
+
+        self.model_dir = os.path.join(self.model_dir, self.config['env_name'])
+        os.makedirs(self.model_dir, exist_ok=True)
+        logger.info(f"Specific Model directory created at {self.model_dir}")
+
+        self.model_filename = f"mindmodel_{self.horizon}.pt"
+
+    def train_(self, train_loader):
+        self.model.train()
+        best_loss = float('inf')
+        total_loss = 0
+
+        for batch in train_loader:
+            obs = batch['obs'].to(self.device)               # [B, input_dim]
+            action = batch['actions'].to(self.device)        # [B, horizon]
+            next_obs = batch['next_obs'].to(self.device)     # [B, horizon, input_dim]
+            reward = batch['rewards'].to(self.device)        # [B, horizon]
+            done = batch['dones'].to(self.device)            # [B, horizon]
+
+            batch_size = obs.size(0)
+            obs = batch['obs'].to(self.device).unsqueeze(0)
+            # Forward pass
+            prev_obs = torch.randn(batch_size, self.config['input_dim']).to(self.device)
+            output = self.model.horizon_predict(obs, action, prev_obs)  # horizon prediction
+
+            pred_next_obs = output['next_obs']      # list of [B, input_dim]
+            pred_reward = output['reward']          # list of [B, 1]
+            pred_done = output['done']              # list of [B, 1]
+
+            loss_next_obs = 0
+            loss_reward = 0
+            loss_done = 0
+
+            for i in range(self.horizon):
+                loss_next_obs += self.MseLoss(pred_next_obs[i], next_obs[:, i, :])
+                loss_reward += self.MseLoss(pred_reward[i].squeeze(-1), reward[:, i])
+                loss_done += self.BCELoss(pred_done[i].squeeze(-1), done[:, i])
+
+            loss_next_obs /= self.horizon
+            loss_reward /= self.horizon
+            loss_done /= self.horizon
+
+            total = loss_next_obs + loss_reward + loss_done
+
+            self.model.optimizer.zero_grad()
+            total.backward()
+            self.model.optimizer.step()
+
+            total_loss += total.item()
+        avg_loss = total_loss / len(train_loader)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            self.model.save(self.model_dir, filename=self.model_filename)
+
+        return avg_loss
+    
+
+
+    def train(self, train_loader, num_epochs=10, log_interval=1):
+        best_loss = float('inf')
+        
+        for epoch in range(1, num_epochs + 1):
+            self.model.train()
+            total_loss = 0
+            total_batches = 0
+
+            total_done_correct = 0
+            total_done_samples = 0
+
+            for batch in train_loader:
+                obs = batch['obs'].to(self.device)               # [B, input_dim]
+                action = batch['actions'].to(self.device)        # [B, horizon]
+                next_obs = batch['next_obs'].to(self.device)     # [B, horizon, input_dim]
+                reward = batch['rewards'].to(self.device)        # [B, horizon]
+                done = batch['dones'].to(self.device)            # [B, horizon]
+
+                batch_size = obs.size(0)
+                obs = obs.unsqueeze(0)  # [1, B, input_dim]
+
+                prev_obs = torch.randn(batch_size, self.config['input_dim']).to(self.device)
+                output = self.model.horizon_predict(obs, action, prev_obs)  # horizon prediction
+
+                pred_next_obs = output['next_obs']  # list of [B, input_dim]
+                pred_reward = output['reward']      # list of [B, 1]
+                pred_done = output['done']          # list of [B, 1]
+
+                loss_next_obs = 0
+                loss_reward = 0
+                loss_done = 0
+
+                for i in range(self.horizon):
+                    loss_next_obs += self.MseLoss(pred_next_obs[i], next_obs[:, i, :])
+                    loss_reward += self.MseLoss(pred_reward[i].squeeze(-1), reward[:, i])
+                    loss_done += self.BCELoss(pred_done[i].squeeze(-1), done[:, i])
+
+                    # Binary accuracy logging
+                    pred_labels = (pred_done[i].squeeze(-1) > 0.5).float()
+                    total_done_correct += (pred_labels == done[:, i]).sum().item()
+                    total_done_samples += done[:, i].numel()
+
+                loss_next_obs /= self.horizon
+                loss_reward /= self.horizon
+                loss_done /= self.horizon
+
+                total = loss_next_obs + loss_reward + loss_done
+
+                self.model.optimizer.zero_grad()
+                total.backward()
+                self.model.optimizer.step()
+
+                total_loss += total.item()
+                total_batches += 1
+
+            avg_loss = total_loss / total_batches
+            avg_done_acc = total_done_correct / total_done_samples
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                self.model.save(self.model_dir, filename=self.model_filename)
+
+            if epoch % log_interval == 0:
+                logger.info(f"Epoch [{epoch}/{num_epochs}] | Loss: {avg_loss:.6f} | Done Accuracy: {avg_done_acc:.4f}")
+
+
