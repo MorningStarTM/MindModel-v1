@@ -54,13 +54,13 @@ mind_model_config = {
     # Model architecture
     "embedding_dim": 64,          # Size of embedding from input before RNN
     "hidden_dim": 128,            # LSTM hidden size (can be increased)
-    "n_layers": 2,                # Number of LSTM layers
+    "n_layers": 4,                # Number of LSTM layers
     "dropout": 0.1,               # Dropout for encoder RNN
 
     # Training
-    "lr_encoder": 1e-4,           # Learning rate for encoder
-    "lr_decoder": 1e-4,           # Learning rate for decoder
-    "lr":1e-4,
+    "lr_encoder": 1e-6,           # Learning rate for encoder
+    "lr_decoder": 1e-6,           # Learning rate for decoder
+    "lr":1e-6,
     "horizon": 1,                 # Prediction horizon (e.g., 2-step prediction)
 
     # Environment info
