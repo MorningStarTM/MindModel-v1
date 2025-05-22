@@ -490,5 +490,50 @@ class MindModel(nn.Module):
 
 
 
+###############################################################################################################################################################
+###############################################################################################################################################################
+###############################################################################################################################################################
 
 
+class MindPolicyDecoder(MindDecoder):
+    def __init__(self, config):
+        super().__init__(config)
+        # Replace prediction heads with action policy head
+        self.policy_head = nn.Linear(self.config['hidden_dim'], self.config['action_dim'])
+        self.value_head = nn.Linear(self.config['hidden_dim'], 1)
+        # Optionally, delete the old heads (cleaner)
+        del self.next_obs_head
+        del self.reward_head
+        del self.done_head
+
+    def act(self, encoder_hidden,prev_context=None):
+        batch_size = encoder_hidden.size(1)
+
+
+        if prev_context is None:
+            decoder_input = torch.zeros(1, batch_size, self.config['hidden_dim'], device=self.device)
+        else:
+            embedded_context = self.context_embed(prev_context)  # [batch_size, hidden_dim]
+            decoder_input = embedded_context.unsqueeze(0)  # [1, batch_size, hidden_dim]
+        # encoder_hidden: [n_layers, batch_size, hidden_dim]
+        
+
+        h = encoder_hidden  # Use all layers
+        c = torch.zeros_like(h)
+
+        out, (h_out, c_out) = self.rnn(decoder_input, (h, c))
+        h_out = h_out[-1]  # use last layer’s output
+
+        action_logits = self.policy_head(h_out)
+        value = self.value_head(h_out)
+
+
+        return action_logits, value
+    
+    def set_action_std(self, new_action_std):
+        if self.config['has_continuous_action_space']:
+            self.action_var = torch.full((self.config['action_dim'],), new_action_std * new_action_std).to(self.device)
+        else:
+            print("--------------------------------------------------------------------------------------------")
+            print("WARNING : Calling ActorCritic::set_action_std() on discrete action space policy")
+            print("--------------------------------------------------------------------------------------------")
