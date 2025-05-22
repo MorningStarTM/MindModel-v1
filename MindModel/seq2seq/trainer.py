@@ -16,6 +16,7 @@ import torch.nn as nn
 from tqdm import trange
 import numpy as np
 import csv
+from datetime import datetime
 
 
 
@@ -264,7 +265,9 @@ class MindModelTrainer:
         os.makedirs(self.model_dir, exist_ok=True)
         logger.info(f"Specific Model directory created at {self.model_dir}")
 
-        self.model_filename = f"mindmodel_{self.horizon}.pt"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.model_filename = f"mindmodel_h{self.horizon}_{timestamp}.pt"
+
 
     def train_(self, train_loader):
         self.model.train()
