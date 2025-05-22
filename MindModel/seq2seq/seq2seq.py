@@ -280,7 +280,7 @@ class RLSeq2Seq(nn.Module):
 
 
 
-    def save_models(self, checkpoint="models/seq2seq"):
+    def save_models(self, checkpoint=f"models/seq2seq"):
         os.makedirs(checkpoint, exist_ok=True)
         torch.save(self.encoder.state_dict(), os.path.join(checkpoint, "encoder.pt"))
         torch.save(self.decoder.state_dict(), os.path.join(checkpoint, "decoder.pt"))
@@ -537,3 +537,204 @@ class MindPolicyDecoder(MindDecoder):
             print("--------------------------------------------------------------------------------------------")
             print("WARNING : Calling ActorCritic::set_action_std() on discrete action space policy")
             print("--------------------------------------------------------------------------------------------")
+
+
+
+
+
+class MindModelAgent(nn.Module):
+    def __init__(self, config, pretrained_model_path, pretrained_model_name="mindmodel.pt"):
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.config = config
+        self.encoder = MindEncoder(config).to(self.device)
+        self.decoder = MindPolicyDecoder(config).to(self.device)
+        self.policy_old = MindPolicyDecoder(config).to(self.device)
+        self.buffer = RolloutBuffer()
+        
+        self.gamma = self.config['gamma']
+        self.eps_clip = self.config['eps_clip']
+        self.K_epochs = self.config['K_epochs']
+        
+        # Load the trained weights (MindModel was trained with MindDecoder, not policy decoder)
+        pretrained = MindModel(self.encoder, MindDecoder(config), config)
+        pretrained.load(pretrained_model_path, pretrained_model_name)
+        self.encoder.load_state_dict(pretrained.encoder.state_dict())
+        # For the decoder, load only shared weights (not output heads)
+        decoder_state_dict = pretrained.decoder.state_dict()
+        policy_decoder_dict = self.decoder.state_dict()
+        # Only load matching keys (shared RNN/context_embed weights)
+        filtered_dict = {k: v for k, v in decoder_state_dict.items() if k in policy_decoder_dict}
+        policy_decoder_dict.update(filtered_dict)
+        self.decoder.load_state_dict(policy_decoder_dict)
+        self.policy_old.load_state_dict(self.decoder.state_dict())
+
+        self.optimizer = torch.optim.Adam([
+                        {'params': self.encoder.parameters(), 'lr': self.config['lr_encoder']},
+                        {'params': self.decoder.parameters(), 'lr': self.config['lr_decoder']}
+                    ])
+
+    def forward(self, obs, prev_obs, prev_action):
+        # obs: [batch, 1, input_dim]
+        # prev_obs: [batch, input_dim]
+        # prev_action: [batch]
+        hidden_state, _ = self.encoder(obs)
+        logits = self.decoder(hidden_state, prev_obs, prev_action)
+        return logits
+
+    def select_action(self, state, prev_context=None):
+
+        if self.config['has_continuous_action_space']:
+            with torch.no_grad():
+                state = torch.FloatTensor(state).to(self.device)
+                hidden_state, _ = self.encoder(state.unsqueeze(0).unsqueeze(0))
+                action, action_logprob, state_val = self.policy_old.act(hidden_state)
+
+            self.buffer.states.append(state)
+            self.buffer.actions.append(action)
+            self.buffer.logprobs.append(action_logprob)
+            self.buffer.state_values.append(state_val)
+
+            return action.detach().cpu().numpy().flatten()
+        else:
+            with torch.no_grad():
+                state = torch.FloatTensor(state).to(self.device)
+                hidden_state, _ = self.encoder(state.unsqueeze(0).unsqueeze(0))  # [1, 1, obs_dim]
+                if prev_context is not None:
+                    prev_context = torch.FloatTensor(prev_context).to(self.device).unsqueeze(0)  # [1, context_dim]
+                action_logits, state_val = self.policy_old.act(hidden_state, prev_context)
+                dist = Categorical(logits=action_logits)
+                action = dist.sample()
+                action_logprob = dist.log_prob(action)
+
+
+
+            self.buffer.states.append(state)
+            self.buffer.actions.append(action.detach())
+            self.buffer.logprobs.append(action_logprob.detach())
+            self.buffer.state_values.append(state_val.detach())
+
+            return action.item(), prev_context.squeeze(0).cpu().numpy() if prev_context is not None else None
+
+
+    
+    def evaluate(self, state, action, prev_context=None):
+        if state.dim() == 2:
+            state = state.unsqueeze(0)
+        hidden_state, _ = self.encoder(state)
+        if prev_context is not None:
+            prev_context = prev_context.to(self.device)
+        action_probs, state_values = self.decoder.act(hidden_state, prev_context)
+        dist = Categorical(logits=action_probs)
+        action_logprobs = dist.log_prob(action)
+        dist_entropy = dist.entropy()
+
+        return action_logprobs, state_values, dist_entropy
+    
+
+    def set_action_std(self, new_action_std):
+        if self.config['has_continuous_action_space']:
+            self.action_std = new_action_std
+            self.decoder.set_action_std(new_action_std)
+            self.policy_old.set_action_std(new_action_std)
+        else:
+            print("--------------------------------------------------------------------------------------------")
+            print("WARNING : Calling PPO::set_action_std() on discrete action space policy")
+            print("--------------------------------------------------------------------------------------------")
+
+    
+    def decay_action_std(self, action_std_decay_rate, min_action_std):
+        print("--------------------------------------------------------------------------------------------")
+        if self.config['has_continuous_action_space']:
+            self.action_std = self.action_std - action_std_decay_rate
+            self.action_std = round(self.action_std, 4)
+            if (self.action_std <= min_action_std):
+                self.action_std = min_action_std
+                print("setting actor output action_std to min_action_std : ", self.action_std)
+            else:
+                print("setting actor output action_std to : ", self.action_std)
+            self.set_action_std(self.action_std)
+
+        else:
+            print("WARNING : Calling PPO::decay_action_std() on discrete action space policy")
+        print("--------------------------------------------------------------------------------------------")
+
+
+    def update(self):
+        # Monte Carlo estimate of returns
+        rewards = []
+        discounted_reward = 0
+        for reward, is_terminal in zip(reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)):
+            if is_terminal:
+                discounted_reward = 0
+            discounted_reward = reward + (self.gamma * discounted_reward)
+            rewards.insert(0, discounted_reward)
+            
+        # Normalizing the rewards
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+
+        # convert list to tensor
+        old_states = torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(self.device)
+        old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(self.device)
+        old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(self.device)
+        old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(self.device)
+        old_prev_contexts = torch.squeeze(torch.stack(self.buffer.prev_contexts, dim=0)).detach().to(self.device)
+
+        # calculate advantages
+        advantages = rewards.detach() - old_state_values.detach()
+
+        # Optimize policy for K epochs
+        for _ in range(self.K_epochs):
+
+            # Evaluating old actions and values
+            logprobs, state_values, dist_entropy = self.evaluate(old_states, old_actions, old_prev_contexts)
+
+            # match state_values tensor dimensions with rewards tensor
+            state_values = torch.squeeze(state_values)
+            
+            # Finding the ratio (pi_theta / pi_theta__old)
+            ratios = torch.exp(logprobs - old_logprobs.detach())
+
+            # Finding Surrogate Loss  
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+
+            # final loss of clipped objective PPO
+            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - 0.01 * dist_entropy
+            
+            # take gradient step
+            self.optimizer.zero_grad()
+            loss.mean().backward()
+            torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), max_norm=0.5)
+
+            self.optimizer.step()
+            
+        # Copy new weights into old policy
+        self.policy_old.load_state_dict(self.decoder.state_dict())
+
+        # clear buffer
+        self.buffer.clear()
+
+    
+    def save_models(self, checkpoint="models/seq2seq"):
+        os.makedirs(checkpoint, exist_ok=True)
+        torch.save(self.encoder.state_dict(), os.path.join(checkpoint, f"encoder_{self.config['horizon']}.pt"))
+        torch.save(self.decoder.state_dict(), os.path.join(checkpoint, f"decoder_{self.config['horizon']}.pt"))
+        logger.info(f"Models saved to {checkpoint}")
+
+    def load_models(self, checkpoint="models/seq2seq"):
+        encoder_path = os.path.join(checkpoint, f"encoder_{self.config['horizon']}.pt")
+        decoder_path = os.path.join(checkpoint, f"decoder_{self.config['horizon']}.pt")
+
+        if os.path.exists(encoder_path):
+            self.encoder.load_state_dict(torch.load(encoder_path, map_location=self.device))
+        else:
+            logger.warning(f"Encoder checkpoint not found at {encoder_path}")
+
+        if os.path.exists(decoder_path):
+            self.decoder.load_state_dict(torch.load(decoder_path, map_location=self.device))
+        else:
+            logger.warning(f"Decoder checkpoint not found at {decoder_path}")
+
+        logger.info(f"Models loaded from {checkpoint}")
