@@ -127,6 +127,7 @@ class Seq2SeqTrainer:
 
                 decoder_input = None
                 if prev_obs is not None and prev_action is not None:
+                    
                     one_hot_action = np.eye(self.config['action_dim'])[prev_action]
                     decoder_input = np.concatenate([prev_obs, one_hot_action])
                 else:
@@ -229,8 +230,8 @@ class Seq2SeqTrainer:
         logger.info("Total training time  : ", end_time - start_time)
         logger.info("============================================================================================")
 
-        np.save(os.path.join(self.reward_folder, f"seq2seqBasic_{self.env_name}_step_rewards.npy"), np.array(self.step_rewards))
-        np.save(os.path.join(self.reward_folder, f"seq2seqBasic_{self.env_name}_episode_rewards.npy"), np.array(self.episode_rewards))
+        np.save(os.path.join(self.reward_folder, f"seq2seqBasic_{self.env_name}_{self.config['horizon']}_step_rewards.npy"), np.array(self.step_rewards))
+        np.save(os.path.join(self.reward_folder, f"seq2seqBasic_{self.env_name}_{self.config['horizon']}_episode_rewards.npy"), np.array(self.episode_rewards))
         logger.info(f"Saved step_rewards and episode_rewards to {self.log_dir}")
 
 
@@ -342,6 +343,7 @@ class MindModelTrainer:
                 obs = obs.unsqueeze(0)  # [1, B, input_dim]
 
                 prev_obs = torch.randn(batch_size, self.config['input_dim']).to(self.device)
+
                 output = self.model.horizon_predict(obs, action, prev_obs)  # horizon prediction
 
                 pred_next_obs = output['next_obs']  # list of [B, input_dim]

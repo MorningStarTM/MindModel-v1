@@ -336,56 +336,50 @@ class MindEncoder(nn.Module):
 
 
 class MindDecoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config:dict):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.config = config
 
-        self.rnn = nn.LSTM(self.config['hidden_dim'], self.config['hidden_dim'], self.config['n_layers'])
-        self.context_embed = nn.Linear(self.config['input_dim'] + self.config['action_dim'], self.config['hidden_dim'])
+        self.rnn = nn.LSTM(
+            self.config['hidden_dim'], 
+            self.config['hidden_dim'], 
+            self.config['n_layers']
+        )
+        self.context_embed = nn.Linear(
+            self.config['input_dim'] + self.config['action_dim'], 
+            self.config['hidden_dim']
+        )
 
-        # output heads
-        self.next_obs_head = nn.Linear(self.config['hidden_dim'], self.config['input_dim'])
-        self.reward_head = nn.Linear(self.config['hidden_dim'], 1)
-        self.done_head = nn.Linear(self.config['hidden_dim'], 1)  # sigmoid for binary
+        # Optional MLP head after LSTM
+        self.use_mlp = self.config.get('mlp_add', False)
+        if self.use_mlp:
+            mlp_hidden = self.config.get('mlp_hidden_dim', self.config['hidden_dim'])
+            mlp_layers = []
+            last_dim = self.config['hidden_dim']
+            for dim in mlp_hidden if isinstance(mlp_hidden, (list, tuple)) else [mlp_hidden]:
+                mlp_layers.append(nn.Linear(last_dim, dim))
+                mlp_layers.append(nn.ReLU())
+                last_dim = dim
+            self.mlp = nn.Sequential(*mlp_layers)
+            pred_input_dim = last_dim
+        else:
+            pred_input_dim = self.config['hidden_dim']
+
+        # Output heads
+        self.next_obs_head = nn.Linear(pred_input_dim, self.config['input_dim'])
+        self.reward_head = nn.Linear(pred_input_dim, 1)
+        self.done_head = nn.Linear(pred_input_dim, 1)
 
 
-    def forward_(self, hidden_state, action, prev_obs):
-        # Ensure action is converted to one-hot correctly
-        action_one_hot = F.one_hot(action, num_classes=self.config['action_dim']).float().to(self.device)
-        logger.debug(f"Action one-hot shape: {action_one_hot.shape}")
-
-        # Make sure both are 1D
-        if prev_obs.dim() == 2:
-            prev_obs = prev_obs.squeeze(0)  # From [1, input_dim] to [input_dim]
-        logger.info(f"prev obs shape: {prev_obs.shape}")
-        # Concatenate: [input_dim + action_dim]
-        prev_cont = torch.cat([prev_obs, action_one_hot], dim=-1).unsqueeze(0)  # Shape: [1, input+action]
-        
-        # Embed and reshape for RNN: [1, 1, hidden_dim]
-        embedded_input = self.context_embed(prev_cont).unsqueeze(0)
-
-        # Init hidden/cell
-        h = hidden_state
-        c = torch.zeros_like(h).to(self.device)
-
-        out, _ = self.rnn(embedded_input, (h, c))
-        out = out.squeeze(0).squeeze(0)
-
-        # Heads
-        next_obs = self.next_obs_head(out)
-        reward = self.reward_head(out)
-        done = torch.sigmoid(self.done_head(out))
-
-        return next_obs, reward, done
-    
     def forward(self, hidden_state, action, prev_obs):
         """
         hidden_state: [n_layers, batch_size, hidden_dim]
-        action: [batch_size]  (discrete action index)
-        obs: [batch_size, input_dim]
+        action: [batch_size] (discrete action index)
+        prev_obs: [batch_size, input_dim]
         """
-        assert torch.max(action).item() < self.config['action_dim'], f"Invalid action index {torch.max(action).item()}, must be < action_dim={self.config['action_dim']}"
+        assert torch.max(action).item() < self.config['action_dim'], \
+            f"Invalid action index {torch.max(action).item()}, must be < action_dim={self.config['action_dim']}"
 
         action_one_hot = F.one_hot(action, num_classes=self.config['action_dim']).float().to(self.device)
         prev_cont = torch.cat([prev_obs, action_one_hot], dim=-1)  # [batch_size, input+action]
@@ -397,6 +391,11 @@ class MindDecoder(nn.Module):
         out, _ = self.rnn(embedded_input, (h, c))  # [1, batch, hidden_dim]
         out = out.squeeze(0)  # [batch, hidden_dim]
 
+        # Optional MLP for dynamics
+        if self.use_mlp:
+            out = self.mlp(out)  # Pass through the added MLP
+
+        # Prediction heads
         next_obs = self.next_obs_head(out)
         reward = self.reward_head(out)
         done = torch.sigmoid(self.done_head(out))
@@ -498,38 +497,56 @@ class MindModel(nn.Module):
 class MindPolicyDecoder(MindDecoder):
     def __init__(self, config):
         super().__init__(config)
-        # Replace prediction heads with action policy head
-        self.policy_head = nn.Linear(self.config['hidden_dim'], self.config['action_dim'])
-        self.value_head = nn.Linear(self.config['hidden_dim'], 1)
-        # Optionally, delete the old heads (cleaner)
+
+        # Optionally add MLP after LSTM, like in MindDecoder
+        self.use_mlp = self.config.get('mlp_add', False)
+        if self.use_mlp:
+            mlp_hidden = self.config.get('mlp_hidden_dim', self.config['hidden_dim'])
+            mlp_layers = []
+            last_dim = self.config['hidden_dim']
+            for dim in mlp_hidden if isinstance(mlp_hidden, (list, tuple)) else [mlp_hidden]:
+                mlp_layers.append(nn.Linear(last_dim, dim))
+                mlp_layers.append(nn.ReLU())
+                last_dim = dim
+            self.mlp = nn.Sequential(*mlp_layers)
+            policy_input_dim = last_dim
+        else:
+            policy_input_dim = self.config['hidden_dim']
+
+        # New heads for RL agent
+        self.policy_head = nn.Linear(policy_input_dim, self.config['action_dim'])
+        self.value_head = nn.Linear(policy_input_dim, 1)
+
+        # Delete old heads to save memory
         del self.next_obs_head
         del self.reward_head
         del self.done_head
 
-    def act(self, encoder_hidden,prev_context=None):
+    def act(self, encoder_hidden, prev_context=None):
         batch_size = encoder_hidden.size(1)
 
-
+        # Decoder input logic as before
         if prev_context is None:
             decoder_input = torch.zeros(1, batch_size, self.config['hidden_dim'], device=self.device)
         else:
             embedded_context = self.context_embed(prev_context)  # [batch_size, hidden_dim]
-            decoder_input = embedded_context.unsqueeze(0)  # [1, batch_size, hidden_dim]
-        # encoder_hidden: [n_layers, batch_size, hidden_dim]
-        
+            decoder_input = embedded_context.unsqueeze(0)        # [1, batch_size, hidden_dim]
 
-        h = encoder_hidden  # Use all layers
-        c = torch.zeros_like(h)
+        h = encoder_hidden
+        c = torch.zeros_like(h).to(self.device)
 
         out, (h_out, c_out) = self.rnn(decoder_input, (h, c))
-        h_out = h_out[-1]  # use last layer’s output
+        h_out = h_out[-1]  # last layer’s output [batch_size, hidden_dim]
+
+        # MLP pass if used
+        if self.use_mlp:
+            h_out = self.mlp(h_out)
 
         action_logits = self.policy_head(h_out)
         value = self.value_head(h_out)
 
-
         return action_logits, value
-    
+
     def set_action_std(self, new_action_std):
         if self.config['has_continuous_action_space']:
             self.action_var = torch.full((self.config['action_dim'],), new_action_std * new_action_std).to(self.device)
@@ -537,6 +554,7 @@ class MindPolicyDecoder(MindDecoder):
             print("--------------------------------------------------------------------------------------------")
             print("WARNING : Calling ActorCritic::set_action_std() on discrete action space policy")
             print("--------------------------------------------------------------------------------------------")
+
 
 
 
@@ -568,19 +586,13 @@ class MindModelAgent(nn.Module):
         policy_decoder_dict.update(filtered_dict)
         self.decoder.load_state_dict(policy_decoder_dict)
         self.policy_old.load_state_dict(self.decoder.state_dict())
+        self.MseLoss = nn.MSELoss()
 
         self.optimizer = torch.optim.Adam([
                         {'params': self.encoder.parameters(), 'lr': self.config['lr_encoder']},
                         {'params': self.decoder.parameters(), 'lr': self.config['lr_decoder']}
                     ])
 
-    def forward(self, obs, prev_obs, prev_action):
-        # obs: [batch, 1, input_dim]
-        # prev_obs: [batch, input_dim]
-        # prev_action: [batch]
-        hidden_state, _ = self.encoder(obs)
-        logits = self.decoder(hidden_state, prev_obs, prev_action)
-        return logits
 
     def select_action(self, state, prev_context=None):
 
@@ -719,13 +731,13 @@ class MindModelAgent(nn.Module):
     
     def save_models(self, checkpoint="models/seq2seq"):
         os.makedirs(checkpoint, exist_ok=True)
-        torch.save(self.encoder.state_dict(), os.path.join(checkpoint, f"encoder_{self.config['horizon']}.pt"))
-        torch.save(self.decoder.state_dict(), os.path.join(checkpoint, f"decoder_{self.config['horizon']}.pt"))
+        torch.save(self.encoder.state_dict(), os.path.join(checkpoint, f"encoder_horizon_{self.config['horizon']}.pt"))
+        torch.save(self.decoder.state_dict(), os.path.join(checkpoint, f"decoder_horizon_{self.config['horizon']}.pt"))
         logger.info(f"Models saved to {checkpoint}")
 
     def load_models(self, checkpoint="models/seq2seq"):
-        encoder_path = os.path.join(checkpoint, f"encoder_{self.config['horizon']}.pt")
-        decoder_path = os.path.join(checkpoint, f"decoder_{self.config['horizon']}.pt")
+        encoder_path = os.path.join(checkpoint, f"encoder_horizon_{self.config['horizon']}.pt")
+        decoder_path = os.path.join(checkpoint, f"decoder_horizon_{self.config['horizon']}.pt")
 
         if os.path.exists(encoder_path):
             self.encoder.load_state_dict(torch.load(encoder_path, map_location=self.device))
