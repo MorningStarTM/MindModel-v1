@@ -12,6 +12,12 @@ import torch
 from tqdm import tqdm
 from MindModel.utility.logger import logger
 from MindModel.seq2seq.seq2seq import RLSeq2Seq, MindModel
+from torch.utils.tensorboard import SummaryWriter
+
+from MindModel.seq2seq.transformer import TransformerWorldModel
+from MindModel.utility.dataset import generate_square_subsequent_mask
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 from tqdm import trange
 import numpy as np
@@ -437,3 +443,117 @@ class MindModelTrainer:
 
         logger.info(f"✅ Evaluation complete: Loss={avg_loss:.4f}, Done Accuracy={avg_done_acc:.4f}")
     
+
+
+
+
+class TransformerTrainer:
+    def __init__(self, config, model:TransformerWorldModel, train_loader:DataLoader, save_dir="MindModel_version", lr_scheduler=None):
+        self.model = model
+        self.config = config
+        self.train_loader = train_loader
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=self.config['learning_rate'])
+        self.lr_scheduler = lr_scheduler
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        self.save_dir = os.path.join(self.save_dir, self.config['env_name'])
+        os.makedirs(self.save_dir, exist_ok=True)
+        logger.info(f"Model directory created at {self.save_dir}")
+
+        self.writer = SummaryWriter(log_dir=os.path.join(save_dir, "logs"))
+        self.best_loss = float("inf")
+
+    def save_model(self, name="transformer_model.pt"):
+        path = os.path.join(self.save_dir, name)
+        torch.save(self.model.state_dict(), path)
+        print(f"Model saved to {path}")
+
+    def train(self, num_epochs=100, print_freq=10, val_freq=1):
+        self.model.to(self.device)
+        global_step = 0
+
+        for epoch in range(1, num_epochs + 1):
+            self.model.train()
+            epoch_loss = 0
+            for i, batch in enumerate(self.train_loader):
+                obs = batch["obs"].to(self.device)
+                traj_seq = batch["traj_seq"].to(self.device)
+                action_seq = batch["action_seq"].to(self.device)
+                target_next_obs = batch["target_next_obs"].to(self.device)
+                target_rewards = batch["target_rewards"].to(self.device)
+                target_dones = batch["target_dones"].to(self.device)
+                target_actions = batch["target_actions"].to(self.device)
+
+                horizon = traj_seq.shape[1]
+                tgt_mask = generate_square_subsequent_mask(horizon, device=self.device)
+
+                next_obs_pred, reward_pred, done_pred, action_logits_pred = self.model(
+                    obs, traj_seq, action_seq, src_mask=None, tgt_mask=tgt_mask
+                )
+
+                loss_obs = torch.nn.functional.mse_loss(next_obs_pred, target_next_obs)
+                loss_r = torch.nn.functional.mse_loss(reward_pred.squeeze(-1), target_rewards)
+                loss_done = torch.nn.functional.binary_cross_entropy(done_pred.squeeze(-1), target_dones)
+                loss_action = torch.nn.functional.cross_entropy(
+                    action_logits_pred.view(-1, action_logits_pred.shape[-1]),
+                    target_actions.view(-1)
+                )
+                loss = loss_obs + loss_r + loss_done + loss_action
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                if self.lr_scheduler:
+                    self.lr_scheduler.step()
+
+                epoch_loss += loss.item()
+                self.writer.add_scalar('train/loss', loss.item(), global_step)
+                global_step += 1
+
+                if (i + 1) % print_freq == 0:
+                    print(f"Epoch [{epoch}/{num_epochs}] Batch [{i+1}/{len(self.train_loader)}] Loss: {loss.item():.4f}")
+
+            avg_epoch_loss = epoch_loss / len(self.train_loader)
+            print(f"Epoch [{epoch}/{num_epochs}] avg loss: {avg_epoch_loss:.4f}")
+            self.writer.add_scalar('train/avg_epoch_loss', avg_epoch_loss, epoch)
+
+            if avg_epoch_loss < self.best_loss:
+                self.best_loss = avg_epoch_loss
+                self.save_model()
+
+        self.writer.close()
+
+    @torch.no_grad()
+    def evaluate(self, val_loader:DataLoader):
+        self.model.eval()
+        total_loss = 0
+        for batch in val_loader:
+            obs = batch["obs"].to(self.device)
+            traj_seq = batch["traj_seq"].to(self.device)
+            action_seq = batch["action_seq"].to(self.device)
+            target_next_obs = batch["target_next_obs"].to(self.device)
+            target_rewards = batch["target_rewards"].to(self.device)
+            target_dones = batch["target_dones"].to(self.device)
+            target_actions = batch["target_actions"].to(self.device)
+
+            horizon = traj_seq.shape[1]
+            tgt_mask = generate_square_subsequent_mask(horizon, device=self.device)
+
+            next_obs_pred, reward_pred, done_pred, action_logits_pred = self.model(
+                obs, traj_seq, action_seq, src_mask=None, tgt_mask=tgt_mask
+            )
+
+            loss_obs = torch.nn.functional.mse_loss(next_obs_pred, target_next_obs)
+            loss_r = torch.nn.functional.mse_loss(reward_pred.squeeze(-1), target_rewards)
+            loss_done = torch.nn.functional.binary_cross_entropy(done_pred.squeeze(-1), target_dones)
+            loss_action = torch.nn.functional.cross_entropy(
+                action_logits_pred.view(-1, action_logits_pred.shape[-1]),
+                target_actions.view(-1)
+            )
+            loss = loss_obs + loss_r + loss_done + loss_action
+            total_loss += loss.item()
+        avg_loss = total_loss / len(val_loader)
+        return avg_loss
