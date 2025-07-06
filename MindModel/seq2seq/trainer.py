@@ -513,8 +513,8 @@ class TransformerTrainer:
                 self.writer.add_scalar('train/loss', loss.item(), global_step)
                 global_step += 1
 
-                if (i + 1) % print_freq == 0:
-                    print(f"Epoch [{epoch}/{num_epochs}] Batch [{i+1}/{len(self.train_loader)}] Loss: {loss.item():.4f}")
+                #if (i + 1) % print_freq == 0:
+                #    print(f"Epoch [{epoch}/{num_epochs}] Batch [{i+1}/{len(self.train_loader)}] Loss: {loss.item():.4f}")
 
             avg_epoch_loss = epoch_loss / len(self.train_loader)
             print(f"Epoch [{epoch}/{num_epochs}] avg loss: {avg_epoch_loss:.4f}")
