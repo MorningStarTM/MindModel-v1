@@ -471,10 +471,12 @@ class TransformerTrainer:
         print(f"Model saved to {path}")
 
     def train(self, num_epochs=100, print_freq=10, val_freq=1):
+        logger.info(f"Starting training for {num_epochs} epochs")
         self.model.to(self.device)
         global_step = 0
 
         for epoch in range(1, num_epochs + 1):
+            logger.info(f"Epoch {epoch}/{num_epochs}")
             self.model.train()
             epoch_loss = 0
             for i, batch in enumerate(self.train_loader):
