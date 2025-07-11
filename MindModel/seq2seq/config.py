@@ -42,6 +42,7 @@ config = {
     'horizon': None,
 
     'mlp_hidden_dim':128,
+    'learning_rate':1e-5,
 
     # Misc
     'random_seed': 0                          # Random seed for reproducibility
