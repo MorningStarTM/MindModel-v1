@@ -524,7 +524,7 @@ class TransformerTrainer:
 
             if avg_epoch_loss < self.best_loss:
                 self.best_loss = avg_epoch_loss
-                self.save_model()
+                self.model.save_model()
 
         self.writer.close()
 

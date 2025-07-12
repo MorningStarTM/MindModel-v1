@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import math
+import os
+from MindModel.utility.logger import logger
 
 
 class ObsEmbedding(nn.Module):
@@ -272,3 +274,24 @@ class TransformerWorldModel(nn.Module):
         next_obs, reward, done, action_logits = self.output_head(dec_out)
         # All outputs are [B, seq_len, ...]
         return next_obs, reward, done, action_logits
+    
+
+    def save_model(self, folder: str = "MindModel_version", filename: str = "transformer_model.pt"):
+        os.makedirs(folder, exist_ok=True)
+        save_path = os.path.join(folder, filename)
+        torch.save({
+            'model_state_dict': self.state_dict(),
+        }, save_path)
+        logger.info(f"[✓] TransformerWorldModel saved at: {save_path}")
+
+    def load_model(self, folder: str = "checkpoints", filename: str = "transformer_model.pt"):
+        load_path = os.path.join(folder, filename)
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"[✗] Model checkpoint not found at: {load_path}")
+        
+        checkpoint = torch.load(load_path, map_location=self.device)
+        self.load_state_dict(checkpoint['model_state_dict'])
+        print(f"[✓] TransformerWorldModel loaded from: {load_path}")
+
+
+
