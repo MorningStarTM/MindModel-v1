@@ -14,7 +14,7 @@ from MindModel.utility.logger import logger
 from MindModel.seq2seq.seq2seq import RLSeq2Seq, MindModel
 from torch.utils.tensorboard import SummaryWriter
 
-from MindModel.seq2seq.transformer import TransformerWorldModel
+from MindModel.seq2seq.transformer import TransformerWorldModel, ProbabilisticTransformerWorldModel
 from MindModel.utility.dataset import generate_square_subsequent_mask
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -559,3 +559,92 @@ class TransformerTrainer:
             total_loss += loss.item()
         avg_loss = total_loss / len(val_loader)
         return avg_loss
+
+
+
+
+
+class ProbabilisticTransformerTrainer:
+    def __init__(self, config, model:ProbabilisticTransformerWorldModel, train_loader:DataLoader, save_dir="MindModel_version", lr_scheduler=None):
+        self.model = model
+        self.config = config
+        self.train_loader = train_loader
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=self.config['learning_rate'])
+        self.lr_scheduler = lr_scheduler
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        self.save_dir = os.path.join(self.save_dir, self.config['env_name'])
+        os.makedirs(self.save_dir, exist_ok=True)
+        logger.info(f"Model directory created at {self.save_dir}")
+
+        self.writer = SummaryWriter(log_dir=os.path.join(save_dir, "logs"))
+        self.best_loss = float("inf")
+
+    def save_model(self, name="transformer_model.pt"):
+        path = os.path.join(self.save_dir, name)
+        torch.save(self.model.state_dict(), path)
+        print(f"Model saved to {path}")
+
+    def train(self, num_epochs=100, print_freq=10, val_freq=1):
+        logger.info(f"Starting training for {num_epochs} epochs")
+        self.model.to(self.device)
+        global_step = 0
+
+        for epoch in range(1, num_epochs + 1):
+            logger.info(f"Epoch {epoch}/{num_epochs}")
+            self.model.train()
+            epoch_loss = 0
+            for i, batch in enumerate(self.train_loader):
+                obs = batch["obs"].to(self.device)
+                traj_seq = batch["traj_seq"].to(self.device)
+                action_seq = batch["action_seq"].to(self.device)
+                target_next_obs = batch["target_next_obs"].to(self.device)
+                target_rewards = batch["target_rewards"].to(self.device)
+                target_dones = batch["target_dones"].to(self.device)
+                target_actions = batch["target_actions"].to(self.device)
+
+                horizon = traj_seq.shape[1]
+                tgt_mask = generate_square_subsequent_mask(horizon, device=self.device)
+
+                obs_mu, obs_log_std, reward_mu, reward_log_std, done_pred, action_logits_pred = self.model(
+                    obs, traj_seq, action_seq, src_mask=None, tgt_mask=tgt_mask
+                )
+
+                # NLL Loss for obs/reward
+                obs_dist = torch.distributions.Normal(obs_mu, torch.exp(obs_log_std))
+                obs_nll = -obs_dist.log_prob(target_next_obs).mean()
+
+                reward_dist = torch.distributions.Normal(reward_mu, torch.exp(reward_log_std))
+                reward_nll = -reward_dist.log_prob(target_rewards.unsqueeze(-1)).mean()
+
+                # Standard BCE for done, CE for action
+                loss_done = torch.nn.functional.binary_cross_entropy(done_pred.squeeze(-1), target_dones)
+                loss_action = torch.nn.functional.cross_entropy(
+                    action_logits_pred.view(-1, action_logits_pred.shape[-1]),
+                    target_actions.view(-1)
+                )
+
+                loss = obs_nll + reward_nll + loss_done + loss_action
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                if self.lr_scheduler:
+                    self.lr_scheduler.step()
+
+                epoch_loss += loss.item()
+                self.writer.add_scalar('train/loss', loss.item(), global_step)
+                global_step += 1
+            
+            avg_epoch_loss = epoch_loss / len(self.train_loader)
+            print(f"Epoch [{epoch}/{num_epochs}] avg loss: {avg_epoch_loss:.4f}")
+            self.writer.add_scalar('train/avg_epoch_loss', avg_epoch_loss, epoch)
+
+            if avg_epoch_loss < self.best_loss:
+                self.best_loss = avg_epoch_loss
+                self.model.save_model()
+
+        self.writer.close()
