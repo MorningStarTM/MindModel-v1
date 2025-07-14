@@ -185,6 +185,34 @@ class WorldModelOutputHead(nn.Module):
         return next_obs, reward, done, action_logits
 
 
+
+class WorldModelDistOutputHead(nn.Module):
+    def __init__(self, d_model, obs_dim, action_dim):
+        super().__init__()
+        # For obs
+        self.obs_mu = nn.Linear(d_model, obs_dim)
+        self.obs_log_std = nn.Linear(d_model, obs_dim)
+        # For reward
+        self.reward_mu = nn.Linear(d_model, 1)
+        self.reward_log_std = nn.Linear(d_model, 1)
+        # For done (binary)
+        self.done_head = nn.Linear(d_model, 1)
+        # For action (categorical)
+        self.action_head = nn.Linear(d_model, action_dim)
+
+    def forward(self, x):
+        # [B, seq_len, d_model] -> all outputs [B, seq_len, ...]
+        obs_mu = self.obs_mu(x)
+        obs_log_std = self.obs_log_std(x).clamp(-10, 2)   # clamp for stability
+        reward_mu = self.reward_mu(x)
+        reward_log_std = self.reward_log_std(x).clamp(-10, 2)
+        done = torch.sigmoid(self.done_head(x))
+        action_logits = self.action_head(x)
+        return obs_mu, obs_log_std, reward_mu, reward_log_std, done, action_logits
+
+
+
+
 class DecoderBlock(nn.Module):
     def __init__(self, self_attention_block:MultiHeadAttentionBlock, cross_attention_block:MultiHeadAttentionBlock, feed_forward_block:FeedForwardBlock, dropout:float) -> None:
         super().__init__()
@@ -295,3 +323,73 @@ class TransformerWorldModel(nn.Module):
 
 
 
+class ProbabilisticTransformerWorldModel(nn.Module):
+    def __init__(
+        self, 
+        obs_dim, action_dim, d_model=256, N=4, h=8, dropout=0.1, d_ff=512, max_len=32
+    ):
+        super().__init__()
+        # Embeddings
+        self.obs_embed = ObsEmbedding(obs_dim, d_model)
+        self.trajact_embed = TrajActEmbedding(obs_dim + 2, action_dim, d_model)
+        self.src_pos = PositionalEncoding(d_model, max_len, dropout)
+        self.tgt_pos = PositionalEncoding(d_model, max_len, dropout)
+        # Encoder
+        encoder_blocks = nn.ModuleList([
+            EncoderBlock(
+                MultiHeadAttentionBlock(d_model, h, dropout),
+                FeedForwardBlock(d_model, d_ff, dropout),
+                dropout
+            ) for _ in range(N)
+        ])
+        self.encoder = Encoder(encoder_blocks)
+        # Decoder
+        decoder_blocks = nn.ModuleList([
+            DecoderBlock(
+                MultiHeadAttentionBlock(d_model, h, dropout),
+                MultiHeadAttentionBlock(d_model, h, dropout),
+                FeedForwardBlock(d_model, d_ff, dropout),
+                dropout
+            ) for _ in range(N)
+        ])
+        self.decoder = Decoder(decoder_blocks)
+        # Output heads
+        self.output_head = WorldModelDistOutputHead(d_model, obs_dim, action_dim)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
+    
+    def forward(self, obs, traj_seq, action_seq, src_mask=None, tgt_mask=None):
+        """
+        Standard forward: predict parameters of next-step distributions given context.
+        """
+        src = self.src_pos(self.obs_embed(obs).unsqueeze(1))  # [B, 1, d_model]
+        tgt = self.tgt_pos(self.trajact_embed(traj_seq, action_seq))  # [B, seq_len, d_model]
+        memory = self.encoder(src, src_mask)  # [B, 1, d_model]
+        dec_out = self.decoder(tgt, memory, src_mask, tgt_mask)  # [B, seq_len, d_model]
+        # Distributional outputs:
+        obs_mu, obs_log_std, reward_mu, reward_log_std, done, action_logits = self.output_head(dec_out)
+        return obs_mu, obs_log_std, reward_mu, reward_log_std, done, action_logits
+    
+    def sample(self, obs_mu, obs_log_std):
+        std = torch.exp(obs_log_std)
+        return obs_mu + std * torch.randn_like(std)
+
+
+    
+
+    def save_model(self, folder: str = "MindModel_version", filename: str = "probabilistic_transformer_model.pt"):
+        os.makedirs(folder, exist_ok=True)
+        save_path = os.path.join(folder, filename)
+        torch.save({
+            'model_state_dict': self.state_dict(),
+        }, save_path)
+        logger.info(f"[✓] TransformerWorldModel saved at: {save_path}")
+
+    def load_model(self, folder: str = "checkpoints", filename: str = "probabilistic_transformer_model.pt"):
+        load_path = os.path.join(folder, filename)
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"[✗] Model checkpoint not found at: {load_path}")
+        
+        checkpoint = torch.load(load_path, map_location=self.device)
+        self.load_state_dict(checkpoint['model_state_dict'])
+        print(f"[✓] TransformerWorldModel loaded from: {load_path}")
