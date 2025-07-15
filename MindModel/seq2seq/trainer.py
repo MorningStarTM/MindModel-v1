@@ -613,13 +613,17 @@ class ProbabilisticTransformerTrainer:
                 )
 
                 # NLL Loss for obs/reward
-                obs_dist = torch.distributions.Normal(obs_mu, torch.exp(obs_log_std))
-                obs_nll = -obs_dist.log_prob(target_next_obs).mean()
+                obs_std = torch.exp(obs_log_std)
+                obs_dist = torch.distributions.Normal(obs_mu, obs_std)
+                obs_nll = -obs_dist.log_prob(target_next_obs)  # [B, T, obs_dim]
+                obs_nll = obs_nll.sum(dim=-1).mean()           # sum over obs_dim, mean over batch/time
 
-                reward_dist = torch.distributions.Normal(reward_mu, torch.exp(reward_log_std))
-                reward_nll = -reward_dist.log_prob(target_rewards.unsqueeze(-1)).mean()
+                reward_std = torch.exp(reward_log_std)
+                reward_dist = torch.distributions.Normal(reward_mu, reward_std)
+                reward_nll = -reward_dist.log_prob(target_rewards.unsqueeze(-1))  # [B, T, 1]
+                reward_nll = reward_nll.sum(dim=-1).mean()                        # mean over batch/time
 
-                # Standard BCE for done, CE for action
+                # Done and action losses stay the same
                 loss_done = torch.nn.functional.binary_cross_entropy(done_pred.squeeze(-1), target_dones)
                 loss_action = torch.nn.functional.cross_entropy(
                     action_logits_pred.view(-1, action_logits_pred.shape[-1]),
@@ -627,7 +631,6 @@ class ProbabilisticTransformerTrainer:
                 )
 
                 loss = obs_nll + reward_nll + loss_done + loss_action
-
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
