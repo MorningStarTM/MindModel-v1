@@ -613,15 +613,20 @@ class ProbabilisticTransformerTrainer:
                 )
 
                 # NLL Loss for obs/reward
-                obs_std = torch.exp(obs_log_std)
-                obs_dist = torch.distributions.Normal(obs_mu, obs_std)
-                obs_nll = -obs_dist.log_prob(target_next_obs)  # [B, T, obs_dim]
-                obs_nll = obs_nll.sum(dim=-1).mean()           # sum over obs_dim, mean over batch/time
+                B, T, obs_dim = obs_mu.shape
+                target_next_obs_flat = target_next_obs.reshape(-1, obs_dim)
+                obs_mu_flat = obs_mu.reshape(-1, obs_dim)
+                obs_var_flat = (torch.exp(obs_log_std).reshape(-1, obs_dim)) ** 2
 
-                reward_std = torch.exp(reward_log_std)
-                reward_dist = torch.distributions.Normal(reward_mu, reward_std)
-                reward_nll = -reward_dist.log_prob(target_rewards.unsqueeze(-1))  # [B, T, 1]
-                reward_nll = reward_nll.sum(dim=-1).mean()                        # mean over batch/time
+                gaussian_nll = torch.nn.GaussianNLLLoss(full=True, reduction="mean")
+                obs_nll = gaussian_nll(obs_mu_flat, target_next_obs_flat, obs_var_flat)
+
+                # Reward NLL loss
+                reward_mu_flat = reward_mu.reshape(-1, 1)
+                reward_target_flat = target_rewards.reshape(-1, 1)
+                reward_var_flat = (torch.exp(reward_log_std).reshape(-1, 1)) ** 2
+
+                reward_nll = gaussian_nll(reward_mu_flat, reward_target_flat, reward_var_flat)
 
                 # Done and action losses stay the same
                 loss_done = torch.nn.functional.binary_cross_entropy(done_pred.squeeze(-1), target_dones)
