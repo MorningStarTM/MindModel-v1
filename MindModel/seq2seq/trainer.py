@@ -613,19 +613,25 @@ class ProbabilisticTransformerTrainer:
                 )
 
                 # NLL Loss for obs/reward
+                obs_log_std = obs_log_std.clamp(-4, 2)
+                reward_log_std = reward_log_std.clamp(-4, 2)
+
                 B, T, obs_dim = obs_mu.shape
-                target_next_obs_flat = target_next_obs.reshape(-1, obs_dim)
+
+                # Prepare variance (using exp(2*log_std))
+                epsilon = 1e-5
+                obs_var_flat = torch.exp(2 * obs_log_std).reshape(-1, obs_dim).clamp(min=epsilon)
+                reward_var_flat = torch.exp(2 * reward_log_std).reshape(-1, 1).clamp(min=epsilon)
+
+                # Flatten means and targets
                 obs_mu_flat = obs_mu.reshape(-1, obs_dim)
-                obs_var_flat = (torch.exp(obs_log_std).reshape(-1, obs_dim)) ** 2
-
-                gaussian_nll = torch.nn.GaussianNLLLoss(full=True, reduction="mean")
-                obs_nll = gaussian_nll(obs_mu_flat, target_next_obs_flat, obs_var_flat)
-
-                # Reward NLL loss
+                target_next_obs_flat = target_next_obs.reshape(-1, obs_dim)
                 reward_mu_flat = reward_mu.reshape(-1, 1)
                 reward_target_flat = target_rewards.reshape(-1, 1)
-                reward_var_flat = (torch.exp(reward_log_std).reshape(-1, 1)) ** 2
 
+                # Gaussian NLL
+                gaussian_nll = torch.nn.GaussianNLLLoss(full=True, reduction="mean")
+                obs_nll = gaussian_nll(obs_mu_flat, target_next_obs_flat, obs_var_flat)
                 reward_nll = gaussian_nll(reward_mu_flat, reward_target_flat, reward_var_flat)
 
                 # Done and action losses stay the same
