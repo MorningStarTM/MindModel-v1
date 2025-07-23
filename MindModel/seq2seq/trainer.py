@@ -641,6 +641,12 @@ class ProbabilisticTransformerTrainer:
                     target_actions.view(-1)
                 )
 
+                # Add regularization to log_std to prevent collapse
+                log_std_reg_coeff = 1e-3   # adjust as needed
+                log_std_reg = log_std_reg_coeff * (
+                    obs_log_std.abs().mean() + reward_log_std.abs().mean()
+                )
+                loss = obs_nll + reward_nll + loss_done + loss_action + log_std_reg
                 loss = obs_nll + reward_nll + loss_done + loss_action
                 self.optimizer.zero_grad()
                 loss.backward()
