@@ -647,7 +647,6 @@ class ProbabilisticTransformerTrainer:
                     obs_log_std.abs().mean() + reward_log_std.abs().mean()
                 )
                 loss = obs_nll + reward_nll + loss_done + loss_action + log_std_reg
-                loss = obs_nll + reward_nll + loss_done + loss_action
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -658,6 +657,11 @@ class ProbabilisticTransformerTrainer:
                 epoch_loss += loss.item()
                 self.writer.add_scalar('train/loss', loss.item(), global_step)
                 global_step += 1
+            
+                if global_step % 100 == 0:
+                    print(f"log_std mean (obs): {obs_log_std.mean().item():.3f}, min: {obs_log_std.min().item():.3f}")
+                    print(f"log_std mean (reward): {reward_log_std.mean().item():.3f}, min: {reward_log_std.min().item():.3f}")
+
             
             avg_epoch_loss = epoch_loss / len(self.train_loader)
             print(f"Epoch [{epoch}/{num_epochs}] avg loss: {avg_epoch_loss:.4f}")
