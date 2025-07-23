@@ -613,8 +613,8 @@ class ProbabilisticTransformerTrainer:
                 )
 
                 # NLL Loss for obs/reward
-                obs_log_std = obs_log_std.clamp(-4, 2)
-                reward_log_std = reward_log_std.clamp(-4, 2)
+                obs_log_std = obs_log_std.clamp(-2, 2)
+                reward_log_std = reward_log_std.clamp(-2, 2)
 
                 B, T, obs_dim = obs_mu.shape
 
@@ -642,7 +642,7 @@ class ProbabilisticTransformerTrainer:
                 )
 
                 # Add regularization to log_std to prevent collapse
-                log_std_reg_coeff = 1e-3   # adjust as needed
+                log_std_reg_coeff = 1e-2   # adjust as needed
                 log_std_reg = log_std_reg_coeff * (
                     obs_log_std.abs().mean() + reward_log_std.abs().mean()
                 )
